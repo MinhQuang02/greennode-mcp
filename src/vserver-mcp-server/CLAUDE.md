@@ -13,7 +13,7 @@ groups, SSH keys, placement groups, floating IPs, DHCP option sets).
 Coverage goes past the `greennode-cli` command set: snapshots, route tables,
 network ACLs, VPC peering, interconnects and virtual IPs have no CLI equivalent.
 
-- **183 tools** with `--allow-write`, **84** in the default read-only mode, plus
+- **184 tools** with `--allow-write`, **85** in the default read-only mode, plus
   **10 MCP prompts** and a `get_feature_guide` tool serving the same guidance.
 - Endpoints left out on purpose are listed under *Deliberate scope limits* with
   the reason for each.
@@ -21,8 +21,8 @@ network ACLs, VPC peering, interconnects and virtual IPs have no CLI equivalent.
   write tools through a full create → update → delete cycle on throwaway
   resources (instances, volumes, subnets, ACLs, route tables, security groups
   and rules, SSH keys, placement groups, DHCP option sets, snapshot
-  configurations, tags). VPC creation and custom ACL rules are the two gaps —
-  see *Known open question*.
+  configurations, tags, and VPCs including their MTU/CIDR rules). Custom ACL
+  rules are the one remaining gap — see *Known open question*.
 - Region-scoped like VKS (`HCM-3` / `HAN`), unlike the global vMonitor server.
 - Product documentation: <https://docs.greennode.ai/vserver>.
 
@@ -34,6 +34,18 @@ Everything below is **verified against the live HCM-3 gateway**, not inferred.
 
 - Two region gateways: `https://hcm-3.api.vngcloud.vn/vserver/vserver-gateway`
   and `https://han-1.api.vngcloud.vn/vserver/vserver-gateway`.
+- **The console's host is the same backend.** Its
+  `https://<region>.console.greennode.ai/vserver/iam-vserver-gateway` answers
+  every path with byte-identical bodies to the gateway above (compared live on
+  both regions: `dynamic-config`, networks, zones, projects, subnet list,
+  detail and PATCH). Use the `api.vngcloud.vn` gateway for everything —
+  including what a browser capture shows on the console host. vBackup is the
+  one genuinely separate host (see *Snapshots*).
+- `GET /v1/common/dynamic-config` is **not project-scoped** and answers a
+  **bare object** with no envelope of any kind:
+  `{"mtuConfig": [1500, 1450, 8500, 8950], "cidrNotationConfigs": ["/16", … "/28"]}`
+  — the catalogue the console's create-VPC form reads; `get_vpc_config_options`
+  exposes it.
 - Nearly every path is project-scoped, and **path versions are mixed**: `/v2/{projectId}/...`
   for resources (servers, volumes, networks, secgroups, sshKeys, serverGroups…)
   and `/v1/{projectId}/...` for catalogues (zones, images, flavors, volume types,
@@ -362,15 +374,97 @@ use it for these three collections and never the bare fetch.
 
 ### Write bodies
 
-- `create_vpc` accepts only `name`, `cidr`, `zoneId`, `tags` — a VPC has no
-  description and no "default" flag.
+- `create_vpc` accepts only `name`, `cidr`, `mtu`, `zoneId`, `tags` — a VPC has
+  no description and no "default" flag.
 - Every editable resource treats its update body as a **full replacement of the
   editable fields** and requires `name` on each call — passing only a
   description would blank the name. The DTOs therefore mark `name` required on
   `UpdateVpcDto`, `UpdateSubnetDto` and `UpdateSecurityGroupDto`.
-- `secondarySubnetRequests` on a subnet update replaces the whole set: read the
-  current CIDRs from `get_subnet(...).secondary_subnets` and send them back
-  together with any addition.
+- `secondarySubnetRequests` on a subnet update replaces the whole set — and
+  **so does leaving it out**; see *Secondary subnets* below.
+
+### Secondary subnets (verified live on HAN, 2026-09-23)
+
+- **`POST .../subnets/{id}/secondary-subnets` answers with the new range
+  only**: `{"data": {"cidr", "name", "uuid": "sec-sub-…"}}`. Parsed as a
+  `SubnetItem` it came back with empty `status` / `zone_id` / `vpc_id` and an
+  `id` holding the *range's* uuid, which an agent then passed on as a subnet
+  id. `create_secondary_subnet` now re-reads the parent subnet and returns
+  that; the new range is in its `secondary_subnets`.
+- **A subnet PATCH without `secondarySubnetRequests` deletes every secondary
+  range.** A rename-only body `{"name": …}` wiped them all. `update_subnet`
+  therefore re-sends the current set (read first) whenever the caller omits
+  the key; an explicit `[]` still clears them, as asked.
+- The PATCH list is matched to existing ranges by CIDR: entries sent **with or
+  without** `uuid` keep their uuid, a missing entry is deleted, a new one is
+  created. The console uses this PATCH to add ranges; the tool keeps the POST,
+  which appends atomically and cannot drop a range another caller just added.
+- `DELETE .../secondary-subnets/{sec-sub-id}` works and answers an empty body.
+- **A subnet with a secondary range cannot be deleted**: `Cannot delete subnet:
+  Having Virtual Subnet Address is using this subnet.` Remove the ranges first.
+- Right after its last subnet goes, `DELETE` on the VPC can still answer
+  `Cannot delete this VPC because it contains the subnet.` for a few seconds —
+  retry rather than report failure.
+
+### Creating a VPC: the console form is the spec
+
+`create_vpc` mirrors the console's **Create VPC** dialog field for field, and
+the product owner confirmed that form — not the laxer API — is the business
+rule. Where the two differ, this server follows the form:
+
+| Field | Console form | API alone (probed live on HAN) |
+|---|---|---|
+| Name | 5-50 chars, `a-z A-Z 0-9 _ -` | — |
+| CIDR | a base address with a **fixed `/16`**, in `10.0.0.0-10.255.0.0`, `172.16.0.0-172.24.0.0` or `192.168.0.0` | also takes /20, /22, /24; refuses /17, /18, /26, /28 with a bare `Invalid CIDR.` |
+| MTU | dropdown from `dynamic-config`, **1500 preselected** | omitted → silently **1500** |
+| Zone | **mandatory** (`*`), grouped Availability / Local | omitted → silently the region's `isDefault` zone |
+| Tags | optional | optional |
+
+So `CreateVpcDto` requires `name`, `cidr`, `mtu` and `zoneId`, validates the
+name pattern and the CIDR rule itself (accepting the bare base `10.5.0.0` the
+form asks for and normalising it to `/16`), and `create_vpc` then checks:
+
+- **MTU** against the live catalogue. The API enforces the same list
+  (`mtu: MTU value must be one of the following: [1500, 1450, 8500, 8950];`)
+  and does so *before* the quota check, so a quota error means the MTU was
+  fine — but answers with a bare 400, hence the local check that names the
+  allowed values.
+- **Zone** against `list_zones`. The console shows `HCM-1C`, the API wants
+  `HCM03-1C`; the error maps one to the other.
+- **CIDR overlap** against the region's VPCs, read **uncached** and in every
+  status (a DELETING VPC still holds its range; a VPC created seconds ago must
+  count). The API refuses an overlap too, but only as `VPC is overlap with
+  another.` — naming no VPC — so the tool names the clash and lists the CIDRs
+  in use. Overlap is region-scoped: the same /16 exists in both HCM-3 and HAN
+  on the verified account.
+
+Other verified facts:
+
+- Outside the three ranges the API answers `User can't use this range,
+  reserved for system.` — 172.25.0.0 and above included. A base with host bits
+  set (`10.50.7.0/16`) is a bare `Invalid CIDR.`.
+- `dynamic-config`'s `cidrNotationConfigs` (`/16 … /28`) is the **subnet**
+  rule: the subnet endpoint echoes that exact list when it refuses a prefix
+  (`CIDR notation /25 is not allowed. Allowed CIDR notations are [...]`).
+  `get_vpc_config_options` therefore returns it as `subnet_cidr_prefixes` and
+  states the VPC size separately as `vpc_cidr_prefix: "/16"`. An earlier
+  version returned it as plain `cidr_prefixes`, and agents offered /18, /20 …
+  to users as VPC sizes — do not merge the two again.
+- An MTU the catalogue no longer offers can still exist on an old VPC (`8000`
+  on the verified account, now refused on create). The catalogue is "what you
+  may create today".
+- `mtu` round-trips: create response, list and detail all report it.
+- **MTU and CIDR are immutable**; `UpdateVpcDto` carries neither.
+- `mtu` is deliberately **not** a `Literal` — the endpoint is named
+  `dynamic-config` and is the authority on its own value set.
+- VPC quota is per project and region (8 in HCM-3, 5 in HAN on the verified
+  account), a DELETING VPC still counts, and the message is `Bad request:
+  Exceeded VPC quota. Current used: N, max: N.`
+- A VPC reaches `ACTIVE` in seconds; a subnet cannot be deleted while still
+  creating (`Cannot delete the creating subnet`).
+- Zones carry `zoneType` (`AVAILABILITY` / `LOCAL`), `isDefault`, and a
+  display `name` different from the id. "Contact to enable" in a description
+  means support gates the zone per account even though `isEnabled` is true.
 
 ### Misc
 
@@ -398,7 +492,7 @@ use it for these three collections and never the bare fetch.
 | `server.py` | MCPServer entry point, handler registration, CLI flags, auth modes, SERVER_INSTRUCTIONS + runtime-mode addendum |
 | `config.py` | VserverConfig + REGIONS endpoints; profile loading delegates to `mcp_core.config.load_profile` |
 | `auth.py` / `validators.py` | Re-exports of the `mcp_core` TokenManager / `validate_id` |
-| `client.py` | VserverClient extends `mcp_core.http.BaseClient`; adds `delete_with_body` |
+| `client.py` | VserverClient extends `mcp_core.http.BaseClient`; adds `delete_with_body`. Plus `VbackupClient` for the snapshot schedules on the vBackup host |
 | `project.py` | `require_project_id` — region-scoped project resolution + cache |
 | `paging.py` | `as_list` / `unwrap` / `unwrap_one` / `fetch_all_items` / `fetch_paged_items` — the envelope + paging normalisers |
 | `discovery_cache.py` | Package TTL config on top of `mcp_core.cache.DiscoveryCache` |
@@ -409,7 +503,7 @@ use it for these three collections and never the bare fetch.
 | `flavor_handler.py` | Flavor families, platform codes, flavors |
 | `image_handler.py` | System image catalogue |
 | `volumetype_handler.py` | Disk kinds and their IOPS tiers, per zone |
-| `vpc_handler.py` / `subnet_handler.py` | VPC and subnet CRUD |
+| `vpc_handler.py` / `subnet_handler.py` | VPC and subnet CRUD, plus `get_vpc_config_options` — everything the console's create-VPC form offers (MTU catalogue, the /16 rule, CIDRs in use) |
 | `secgroup_handler.py` | Security groups, rules and the API's rule presets |
 | `server_handler.py` | Instance lifecycle, power, interfaces, floating IPs, console |
 | `volume_handler.py` | Block storage, including attach/detach |
@@ -518,18 +612,18 @@ console-only; porting it would need a separate API.
 cd src/vserver-mcp-server && uv run pytest tests/ -v
 ```
 
-174 tests, `respx` for async HTTP mocking — no real API calls, no credentials.
+209 tests, `respx` for async HTTP mocking — no real API calls, no credentials.
 
 | File | Covers |
 |---|---|
 | `test_server.py` | Config, auth, server construction, the write gate |
 | `test_catalogue.py` | Zones, flavors, images, volume types |
-| `test_network.py` | VPC, subnet, security groups and rules |
+| `test_network.py` | VPC (the console-form rules: name, /16 CIDR ranges, overlap, MTU, zone), subnet, security groups and rules |
 | `test_compute.py` | Servers and volumes |
 | `test_infrastructure.py` | SSH keys, placement groups, interfaces, DHCP, tags, guides |
 | `test_snapshots.py` | Snapshot points, policies, rollback, the `items`/`totalItems` envelope |
 | `test_advanced_network.py` | Route tables, ACLs, peering, VIPs, interconnects |
-| `test_gaps.py` | The v1 by-id envelope, console log, boot volume, tier change, secondary subnets, tag catalogue |
+| `test_gaps.py` | The v1 by-id envelope, console log, boot volume, tier change, secondary subnets (create returns the parent; a rename keeps the ranges), tag catalogue |
 
 `scripts/smoke_test.py` drives the read-only tools over the real MCP protocol
 against a live gateway; `scripts/auth-debug-local.sh` exercises the
@@ -542,8 +636,15 @@ resources: instances (create, power, delete with disks), volumes (create,
 attach, detach, delete), subnets and secondary subnets, network ACLs, route
 tables, security groups and rules, SSH keys, placement groups, DHCP option
 sets, snapshot configurations and tags. Floating-IP and elastic-interface
-writes remain mock-tested (both are billable), VPC creation needs free quota,
-and custom ACL rules do not persist — see *Known open question*.
+writes remain mock-tested (both are billable), and custom ACL rules do not
+persist — see *Known open question*.
+
+**VPC creation is verified live** (HAN, 2026-09-22/23): create with a
+non-default MTU, poll to ACTIVE, subnet create/delete inside it, and delete —
+plus the MTU, CIDR-prefix, range and overlap probes written up under
+*Creating a VPC*. Every test resource was removed afterwards. `GET /v1/common/dynamic-config` is
+verified on both regions, and `mtu` comes back on a real VPC in **both** the
+list and the detail response (unlike `bootVolumeId`, which the list withholds).
 
 Credentials, vendor API dumps and third-party checkouts stay out of git; the
 package `.gitignore` blocks the usual filenames. Never commit them and never

@@ -77,6 +77,8 @@ from greennode.vserver_mcp_server.models.network import (
     SecurityGroupRuleSampleListData,
     SubnetItem,
     SubnetListData,
+    VpcCidrInUse,
+    VpcConfigOptionsData,
     VpcItem,
     VpcListData,
 )
@@ -167,6 +169,9 @@ from greennode.vserver_mcp_server.models.requests import (
     UpdateSubnetDto,
     UpdateVirtualIpDto,
     UpdateVpcDto,
+    VPC_CIDR_PREFIX,
+    VPC_CIDR_RANGES,
+    VPC_NAME_RULE,
 )
 
 
@@ -298,6 +303,9 @@ __all__ = [
     "UpdateSubnetDto",
     "UpdateVirtualIpDto",
     "UpdateVpcDto",
+    "VPC_CIDR_PREFIX",
+    "VPC_CIDR_RANGES",
+    "VPC_NAME_RULE",
     "UserImageItem",
     "UserImageListData",
     "VirtualIpItem",
@@ -308,6 +316,8 @@ __all__ = [
     "VolumeListData",
     "VolumeTypeItem",
     "VolumeTypeListData",
+    "VpcCidrInUse",
+    "VpcConfigOptionsData",
     "VpcItem",
     "VpcListData",
     "ZoneItem",

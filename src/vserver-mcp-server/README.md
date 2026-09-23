@@ -6,7 +6,7 @@ images, networking (VPC, subnet, security group, network ACL, route table,
 peering, interconnect, virtual IP, floating IP, network interface, DHCP option
 set), SSH keys and placement groups.
 
-**183 tools** with `--allow-write` (84 in the default read-only mode) and
+**184 tools** with `--allow-write` (85 in the default read-only mode) and
 **10 guided flows**. Coverage goes beyond the `greennode-cli` command set:
 snapshots, route tables, network ACLs, VPC peering, interconnects and virtual
 IPs have no CLI equivalent. Read and write tools alike have been exercised
@@ -165,9 +165,10 @@ written in Vietnamese, like the other GreenNode MCP servers.
 | Tool | Access | Description |
 |------|--------|-------------|
 | `list_vpcs` / `get_vpc` | read | VPCs in the project |
-| `create_vpc` / `update_vpc` / `delete_vpc` | write / write / destructive | Manage VPCs |
+| `get_vpc_config_options` | read | Everything the console's create-VPC form offers: MTU values (bytes), the fixed `/16` and its allowed ranges, and the CIDRs already in use in the region — call before `create_vpc` |
+| `create_vpc` / `update_vpc` / `delete_vpc` | write / write / destructive | Manage VPCs. `create_vpc` follows the console form: name 5-50 chars, a **/16** CIDR in `10.x`, `172.16-172.24` or `192.168` that must not overlap an existing VPC, a mandatory MTU and zone. CIDR and MTU cannot be changed later |
 | `list_subnets` / `get_subnet` | read | Subnets of a VPC (a subnet pins a server's zone) |
-| `create_subnet` / `update_subnet` / `delete_subnet` | write / write / destructive | Manage subnets |
+| `create_subnet` / `update_subnet` / `delete_subnet` | write / write / destructive | Manage subnets. `update_subnet` keeps the secondary ranges unless you pass a new list (the API alone would drop them on a rename) |
 | `list_security_groups` / `get_security_group` | read | Security groups; `system=true` = platform-managed |
 | `create_security_group` / `update_security_group` / `delete_security_group` | write / write / destructive | Manage groups |
 | `list_security_group_rules` / `get_security_group_rule` | read | Rules of a group |
@@ -185,7 +186,7 @@ written in Vietnamese, like the other GreenNode MCP servers.
 | `enable_vpc_dns` | write | Turn on private DNS in a VPC (one-way — no disable exists) |
 | `list_security_group_servers` | read | Servers a security group is attached to — its blast radius |
 | `list_elastic_ips` | read | The console-side view of public addresses |
-| `create_secondary_subnet` / `delete_secondary_subnet` | write / destructive | Extra CIDRs on a subnet |
+| `create_secondary_subnet` / `delete_secondary_subnet` | write / destructive | Extra CIDRs on a subnet; create returns the parent subnet with the new range in `secondary_subnets`. A subnet with ranges left cannot be deleted |
 
 GreenNode system images move remote administration off the default ports: SSH
 listens on **234** and RDP on **3490**. `list_security_group_rule_samples`
@@ -270,7 +271,7 @@ allow-only and stateful, so replies to an allowed flow need no second rule.
 
 ## Testing status
 
-- **174 unit tests**, all HTTP mocked with `respx` — no credentials needed.
+- **209 unit tests**, all HTTP mocked with `respx` — no credentials needed.
 - Every **read** tool has been exercised against a live HCM-3 gateway. Five of
   them (`list_interconnect_circuit_types`, `list_shared_server_snapshots`,
   `get_volume_snapshot_policy`, `list_active_vpcs`, `list_elastic_ips`) answer
@@ -283,10 +284,15 @@ allow-only and stateful, so replies to an allowed flow need no second rule.
   attach, detach, resize-type, delete), subnets, network ACLs, route tables,
   security groups and rules, SSH keys, placement groups, DHCP option sets,
   snapshot configurations and resource tags.
-- Still unverified: creating a **VPC** (needs free quota) and adding a **custom
-  network-ACL rule** — the platform accepts the request and drops the rule; see
-  the open question in `CLAUDE.md`. Floating-IP and elastic-interface writes are
-  mock-tested only.
+- **VPC creation verified live** (HAN): create with a non-default MTU, subnet
+  inside it, delete, all cleaned up. `create_vpc` follows the console form
+  (always `/16`, three private ranges, no overlap, mandatory MTU and zone)
+  even where the API alone is laxer — it would silently default the MTU to
+  1500 and the zone to the region default. Subnets take the wider catalogue
+  `/16, /18, /20, /22, /24, /26, /28`.
+- Still unverified: adding a **custom network-ACL rule** — the platform accepts
+  the request and drops the rule; see the open question in `CLAUDE.md`.
+  Floating-IP and elastic-interface writes are mock-tested only.
 
 ## Development
 

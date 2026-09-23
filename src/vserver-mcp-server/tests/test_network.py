@@ -50,6 +50,65 @@ def client(config):
     return VserverClient(config, TokenManager(config))
 
 
+def _mock_vpc_config_options(
+    mock: respx.MockRouter,
+    mtus: list | None = None,
+    prefixes: list | None = None,
+) -> respx.Route:
+    """Mock the dynamic-config catalogue create_vpc validates against.
+
+    It answers with a bare object — no envelope — like the live gateway.
+    """
+    return mock.get(f"{HCM3}/v1/common/dynamic-config").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "mtuConfig": [1500, 1450, 8500, 8950] if mtus is None else mtus,
+                "cidrNotationConfigs": (
+                    ["/16", "/18", "/20", "/22", "/24", "/26", "/28"]
+                    if prefixes is None
+                    else prefixes
+                ),
+            },
+        )
+    )
+
+
+ZONES = {
+    "data": [
+        {"uuid": "HCM03-1A", "name": "HCM-1A", "zoneType": "AVAILABILITY", "isEnabled": True},
+        {
+            "uuid": "HCM03-1C",
+            "name": "HCM-1C",
+            "zoneType": "AVAILABILITY",
+            "isDefault": True,
+            "isEnabled": True,
+        },
+        {"uuid": "HCM03-BKK-01", "name": "HCM-BKK-1A", "zoneType": "LOCAL", "isEnabled": True},
+    ]
+}
+
+
+def _vpc_body(**overrides) -> CreateVpcDto:
+    """A create body that satisfies every rule of the console form."""
+    fields = {"name": "web-prod", "cidr": "10.5.0.0", "mtu": 1500, "zoneId": "HCM03-1C"}
+    return CreateVpcDto(**{**fields, **overrides})
+
+
+def _mock_create_vpc_lookups(mock: respx.MockRouter, existing: list | None = None) -> respx.Route:
+    """Mock the three reads create_vpc makes before it POSTs.
+
+    Returns the VPC-list route, which create_vpc reads uncached for its overlap
+    check.
+    """
+    _mock_vpc_config_options(mock)
+    mock.get(f"{HCM3}/v1/{PROJECT}/zones").mock(return_value=httpx.Response(200, json=ZONES))
+    vpcs = existing or []
+    return mock.get(f"{HCM3}/v2/{PROJECT}/networks").mock(
+        return_value=httpx.Response(200, json={"listData": vpcs, "totalItem": len(vpcs)})
+    )
+
+
 @pytest.fixture
 def vpcs_rw(config, client):
     return VpcHandler(MCPServer("t"), config, client, DiscoveryCache(), allow_write=True)
@@ -86,11 +145,13 @@ async def test_write_tools_only_registered_in_write_mode(vpcs_ro, vpcs_rw):
         "list_vpcs",
         "get_vpc",
         "list_active_vpcs",
+        "get_vpc_config_options",
     }
     assert {t.name for t in await vpcs_rw.mcp.list_tools()} == {
         "list_vpcs",
         "get_vpc",
         "list_active_vpcs",
+        "get_vpc_config_options",
         "create_vpc",
         "update_vpc",
         "enable_vpc_dns",
@@ -113,7 +174,7 @@ async def test_secgroup_read_tools_available_without_write(secgroups_ro):
 @pytest.mark.asyncio
 async def test_direct_write_call_is_refused_in_read_only_mode(vpcs_ro):
     with pytest.raises(ValueError, match="--allow-write"):
-        await vpcs_ro.create_vpc(body=CreateVpcDto(name="x", cidr="10.0.0.0/16"), region="HCM-3")
+        await vpcs_ro.create_vpc(body=_vpc_body(), region="HCM-3")
 
 
 # ── VPC ───────────────────────────────────────────────────────────────────────
@@ -174,26 +235,194 @@ async def test_get_vpc_handles_the_unwrapped_detail_response(vpcs_rw):
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_create_vpc_sends_only_declared_fields(vpcs_rw):
+async def test_create_vpc_sends_the_console_form_fields(vpcs_rw):
+    """The bare base address the form asks for goes out as a /16."""
     _mock_iam(respx.mock)
+    _mock_create_vpc_lookups(respx.mock)
     route = respx.post(f"{HCM3}/v2/{PROJECT}/networks").mock(
-        return_value=httpx.Response(200, json={"data": {"id": VPC, "displayName": "prod"}})
+        return_value=httpx.Response(200, json={"data": {"id": VPC, "displayName": "web-prod"}})
     )
-    result = await vpcs_rw.create_vpc(
-        body=CreateVpcDto(name="prod", cidr="10.0.0.0/16"), region="HCM-3"
-    )
+    result = await vpcs_rw.create_vpc(body=_vpc_body(mtu=8950), region="HCM-3")
     assert result.id == VPC
-    import json as _json
-
-    assert _json.loads(route.calls[0].request.content) == {
-        "name": "prod",
-        "cidr": "10.0.0.0/16",
+    assert json.loads(route.calls[0].request.content) == {
+        "name": "web-prod",
+        "cidr": "10.5.0.0/16",
+        "mtu": 8950,
+        "zoneId": "HCM03-1C",
     }
+
+
+@pytest.mark.parametrize("missing", ["mtu", "zoneId", "name", "cidr"])
+def test_create_vpc_dto_requires_every_form_field(missing):
+    """The API would default mtu (1500) and the zone silently; the form never does."""
+    fields = {"name": "web-prod", "cidr": "10.5.0.0", "mtu": 1500, "zoneId": "HCM03-1C"}
+    del fields[missing]
+    with pytest.raises(ValidationError):
+        CreateVpcDto(**fields)
 
 
 def test_vpc_dto_rejects_unknown_fields():
     with pytest.raises(ValidationError):
-        CreateVpcDto(name="p", cidr="10.0.0.0/16", description="not a real API field")
+        _vpc_body(description="not a real API field")
+
+
+@pytest.mark.parametrize("cidr", ["10.5.0.0/18", "10.5.0.0/20", "10.5.0.0/24", "10.5.0.0/8"])
+def test_vpc_cidr_is_always_a_16(cidr):
+    """The console has one VPC size. /18 … /28 are subnet lengths, not VPC options."""
+    with pytest.raises(ValidationError, match="always /16"):
+        _vpc_body(cidr=cidr)
+
+
+@pytest.mark.parametrize(
+    "cidr", ["10.0.0.0", "10.255.0.0/16", "172.16.0.0", "172.24.0.0/16", "192.168.0.0"]
+)
+def test_vpc_cidr_accepts_the_console_ranges(cidr):
+    assert _vpc_body(cidr=cidr).cidr.endswith("/16")
+
+
+@pytest.mark.parametrize("cidr", ["172.25.0.0", "172.31.0.0", "192.169.0.0", "8.8.0.0"])
+def test_vpc_cidr_refuses_everything_outside_the_console_ranges(cidr):
+    """172.25+ is answered live with "reserved for system"."""
+    with pytest.raises(ValidationError, match="outside the private ranges"):
+        _vpc_body(cidr=cidr)
+
+
+def test_vpc_cidr_refuses_a_base_with_host_bits():
+    """10.5.3.0/16 is answered live with a bare "Invalid CIDR."."""
+    with pytest.raises(ValidationError, match="ending in .0.0"):
+        _vpc_body(cidr="10.5.3.0")
+
+
+@pytest.mark.parametrize("name", ["web", "has space", "dot.name", "x" * 51])
+def test_vpc_name_follows_the_console_rule(name):
+    with pytest.raises(ValidationError):
+        _vpc_body(name=name)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_vpc_config_options_offers_one_vpc_size_and_the_cidrs_in_use(vpcs_rw):
+    """The catalogue's prefix list is the SUBNET rule and must not pose as VPC sizes."""
+    _mock_iam(respx.mock)
+    _mock_create_vpc_lookups(
+        respx.mock,
+        existing=[
+            {"id": "net-a", "displayName": "app", "cidr": "10.1.0.0/16", "status": "ACTIVE"},
+            {"id": "net-b", "displayName": "old", "cidr": "10.2.0.0/16", "status": "DELETING"},
+        ],
+    )
+    options = await vpcs_rw.get_vpc_config_options(region="HCM-3", refresh=False)
+    assert options.vpc_cidr_prefix == "/16"
+    assert options.vpc_cidr_ranges[1] == "172.16.0.0/16 - 172.24.0.0/16"
+    assert options.subnet_cidr_prefixes == ["/16", "/18", "/20", "/22", "/24", "/26", "/28"]
+    assert options.mtu_options == [1500, 1450, 8500, 8950]
+    assert options.recommended_mtu == 1500
+    assert [(c.name, c.cidr, c.status) for c in options.vpc_cidrs_in_use] == [
+        ("app", "10.1.0.0/16", "ACTIVE"),
+        ("old", "10.2.0.0/16", "DELETING"),
+    ]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_vpc_refuses_an_overlap_and_names_the_vpc(vpcs_rw):
+    """The API says only "VPC is overlap with another." — this names which one."""
+    _mock_iam(respx.mock)
+    _mock_create_vpc_lookups(
+        respx.mock,
+        existing=[
+            {"id": "net-a", "displayName": "taken", "cidr": "10.5.0.0/16", "status": "ACTIVE"}
+        ],
+    )
+    post = respx.post(f"{HCM3}/v2/{PROJECT}/networks")
+    with pytest.raises(ValueError, match=r"overlaps an existing VPC.*taken \(net-a"):
+        await vpcs_rw.create_vpc(body=_vpc_body(), region="HCM-3")
+    assert not post.calls
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_vpc_overlap_counts_a_deleting_vpc(vpcs_rw):
+    _mock_iam(respx.mock)
+    _mock_create_vpc_lookups(
+        respx.mock,
+        existing=[
+            {"id": "net-a", "displayName": "gone", "cidr": "10.5.0.0/16", "status": "DELETING"}
+        ],
+    )
+    with pytest.raises(ValueError, match="overlaps"):
+        await vpcs_rw.create_vpc(body=_vpc_body(), region="HCM-3")
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_vpc_overlap_catches_a_smaller_block_inside(vpcs_rw):
+    """VPCs created outside the console can be /20 — a /16 around one still clashes."""
+    _mock_iam(respx.mock)
+    _mock_create_vpc_lookups(
+        respx.mock,
+        existing=[
+            {"id": "net-a", "displayName": "api", "cidr": "10.5.16.0/20", "status": "ACTIVE"}
+        ],
+    )
+    with pytest.raises(ValueError, match="overlaps"):
+        await vpcs_rw.create_vpc(body=_vpc_body(), region="HCM-3")
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_vpc_reads_the_vpc_list_uncached(vpcs_rw):
+    """A VPC created a moment ago must count, whatever list_vpcs has cached."""
+    _mock_iam(respx.mock)
+    vpc_list = _mock_create_vpc_lookups(respx.mock)
+    await vpcs_rw.list_vpcs(
+        name_filter=None, include_inactive=False, region="HCM-3", refresh=False
+    )
+    respx.post(f"{HCM3}/v2/{PROJECT}/networks").mock(
+        return_value=httpx.Response(200, json={"data": {"id": VPC, "displayName": "web-prod"}})
+    )
+    await vpcs_rw.create_vpc(body=_vpc_body(), region="HCM-3")
+    assert vpc_list.call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_vpc_invalidates_the_list_cache(vpcs_rw):
+    _mock_iam(respx.mock)
+    vpc_list = _mock_create_vpc_lookups(respx.mock)
+    respx.post(f"{HCM3}/v2/{PROJECT}/networks").mock(
+        return_value=httpx.Response(200, json={"data": {"id": VPC, "displayName": "web-prod"}})
+    )
+    await vpcs_rw.list_vpcs(
+        name_filter=None, include_inactive=False, region="HCM-3", refresh=False
+    )
+    await vpcs_rw.create_vpc(body=_vpc_body(), region="HCM-3")
+    await vpcs_rw.list_vpcs(
+        name_filter=None, include_inactive=False, region="HCM-3", refresh=False
+    )
+    assert vpc_list.call_count == 3
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_vpc_rejects_an_mtu_the_platform_does_not_offer(vpcs_rw):
+    """A rejected MTU must name the allowed values, not surface as a bare 400."""
+    _mock_iam(respx.mock)
+    _mock_create_vpc_lookups(respx.mock)
+    post = respx.post(f"{HCM3}/v2/{PROJECT}/networks")
+    with pytest.raises(ValueError, match="Invalid mtu 9000"):
+        await vpcs_rw.create_vpc(body=_vpc_body(mtu=9000), region="HCM-3")
+    assert not post.calls
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_create_vpc_points_a_zone_display_name_to_its_id(vpcs_rw):
+    """The console shows HCM-1C; the API wants HCM03-1C."""
+    _mock_iam(respx.mock)
+    _mock_create_vpc_lookups(respx.mock)
+    with pytest.raises(ValueError, match="its id is 'HCM03-1C'"):
+        await vpcs_rw.create_vpc(body=_vpc_body(zoneId="HCM-1C"), region="HCM-3")
 
 
 @respx.mock

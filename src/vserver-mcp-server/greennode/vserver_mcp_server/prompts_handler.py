@@ -274,19 +274,55 @@ def _create_network_guidance() -> str:
 Tính năng: tạo lớp mạng cho instance chạy trên đó. Được tạo nên bằng cách kết
 hợp tool VPC + subnet (+ DHCP option set nếu cần DNS riêng).
 
-## Quy trình
-1. `create_vpc` `{name, cidr}` — CIDR riêng tư (vd `10.0.0.0/16`), chọn đủ rộng
-   vì **không đổi được về sau**. Poll `get_vpc` tới ACTIVE.
-2. `create_subnet(vpc_id, {name, cidr, zoneId})` — CIDR phải nằm trong CIDR của
-   VPC và không chồng lấn subnet khác. Subnet CHỐT zone cho mọi server đặt lên.
-3. `list_subnets(vpc_id)` xác nhận ACTIVE rồi mới tạo server.
+## Tạo VPC — theo đúng form "Create VPC" trên console
+1. `get_vpc_config_options(region)` — một lần gọi trả đủ những gì form cần:
+   luật đặt tên, `mtu_options` + `recommended_mtu`, luật CIDR của VPC
+   (`vpc_cidr_prefix` luôn là `/16`, `vpc_cidr_ranges`) và
+   `vpc_cidrs_in_use` — CIDR mà các VPC hiện có trong region đang giữ.
+2. `list_zones(region)` — trình bày như console: nhóm **Availability Zone**
+   rồi **Local Zone** (`zone_type`), đánh dấu zone mặc định (`is_default`).
+   Zone có mô tả "Contact to enable" phải được GreenNode support mở cho
+   account — nói rõ trước khi người dùng chọn.
+3. HỎI người dùng từng trường của form, KHÔNG tự điền thay:
+   - **Tên VPC** — 5–50 ký tự, chỉ chữ (a-z, A-Z), số, `_` và `-`.
+   - **CIDR** — người dùng chỉ chọn **địa chỉ gốc**, đuôi luôn là **/16**
+     (không có lựa chọn kích thước). Dải cho phép:
+     `10.0.0.0 – 10.255.0.0`, `172.16.0.0 – 172.24.0.0`, `192.168.0.0`.
+     Hiển thị `vpc_cidrs_in_use` để người dùng chọn một /16 CHƯA dùng — VPC
+     mới không được trùng/chồng lấn VPC nào trong region (kể cả VPC đang
+     CREATING/DELETING). TUYỆT ĐỐI không đưa /18, /20, … ra làm lựa chọn cho
+     VPC: đó là `subnet_cidr_prefixes`, chỉ dùng cho subnet.
+   - **MTU** (byte) — từ `mtu_options`; console chọn sẵn **1500**, gợi ý 1500
+     là đáp án khuyến nghị nhưng vẫn hỏi, vì **không đổi được về sau**. Khi
+     người dùng phân vân: 1500 là Ethernet chuẩn, an toàn nhất; 8500/8950 là
+     jumbo frame, tăng throughput east-west trong VPC nhưng hỏng mọi đường
+     không mang nổi (VPN, peering, ra internet); 1450 chừa chỗ cho tunnel.
+   - **Zone** — BẮT BUỘC, như dấu `*` trên form. Truyền `id` (vd `HCM03-1C`),
+     không truyền tên hiển thị (`HCM-1C`).
+   - **Tag** — tuỳ chọn, cặp key/value.
+4. Tóm tắt đủ 5 trường → xin xác nhận → `create_vpc`. Tool tự kiểm lại
+   chồng lấn CIDR với danh sách VPC mới nhất và báo đúng VPC bị trùng.
+5. Poll `get_vpc` tới ACTIVE (vài giây).
+
+## Tạo subnet
+- `create_subnet(vpc_id, {name, cidr, zoneId})` — CIDR phải nằm trong CIDR
+  của VPC, không chồng lấn subnet khác, prefix lấy từ `subnet_cidr_prefixes`
+  (/16, /18, /20, /22, /24, /26, /28). Subnet CHỐT zone cho mọi server đặt lên.
+- `list_subnets(vpc_id)` xác nhận ACTIVE rồi mới tạo server.
+
+## Sai MTU/CIDR thì sao?
+Không sửa được: `update_vpc` chỉ đổi tên và tag. Muốn khác thì phải xoá VPC
+(sau khi dọn hết subnet/server) và tạo lại — nên đây là câu hỏi phải hỏi kỹ
+ngay từ đầu, không phải thứ điền đại rồi sửa sau.
 
 ## Tuỳ chọn
 - `create_secondary_subnet` — thêm dải CIDR phụ cho subnet (LVS, sub-interface).
   Phải bind từng interface bằng `create_secondary_subnet_address_pair` và cấu
   hình địa chỉ trong OS.
-- `create_dhcp_option` + `update_vpc_dhcp_option` — DNS server riêng và MTU.
-  Hai DNS mặc định của GreenNode luôn có; thêm tối đa 2 cái nữa (tổng 4).
+- `create_dhcp_option` + `update_vpc_dhcp_option` — DNS server riêng và MTU cấp
+  qua DHCP. Hai DNS mặc định của GreenNode luôn có; thêm tối đa 2 cái nữa
+  (tổng 4). Lưu ý MTU ở đây là MTU DHCP phát cho instance, KHÁC với `mtu` của
+  chính VPC (chỉ set được lúc `create_vpc`).
 - `enable_vpc_dns` — bật phân giải tên nội bộ trong VPC. **Một chiều**, API
   không có lệnh tắt. Máy đang chạy có thể cần renew DHCP/reboot mới nhận.
 
@@ -295,8 +331,10 @@ Server/NIC → subnet → VPC. `delete_subnet` bị từ chối khi còn instanc
 (`list_subnet_servers` cho biết máy nào), `delete_vpc` bị từ chối khi còn subnet.
 
 ## Quota
-`get_quota` trước khi tạo — số VPC mỗi project có trần, hết quota thì
-`create_vpc` lỗi dù mọi tham số đều đúng.
+`get_quota` trước khi tạo — số VPC mỗi project có trần (đã gặp 8 ở HCM-3, 5 ở
+HAN), hết quota thì `create_vpc` lỗi `Exceeded VPC quota` dù mọi tham số đều
+đúng. VPC đang `DELETING` vẫn bị tính, nên xoá xong phải chờ mới tạo được cái
+mới. Lưu ý MTU được API kiểm TRƯỚC quota: báo lỗi quota nghĩa là MTU đã hợp lệ.
 """
 
 

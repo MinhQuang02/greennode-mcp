@@ -13,9 +13,27 @@ from pydantic import BaseModel, Field
 class ZoneItem(BaseModel):
     """One availability zone."""
 
-    id: str = Field(..., description="Zone ID (uuid) — pass this as zoneId to other tools")
-    name: str = Field("", description="Zone name, e.g. HCM03-1A")
-    description: str = Field("", description="Human-readable description")
+    id: str = Field(
+        ..., description="Zone ID, e.g. HCM03-1C — pass THIS as zoneId, never the display name"
+    )
+    name: str = Field("", description="Display name the console shows, e.g. HCM-1C")
+    zone_type: str = Field(
+        "",
+        description=(
+            "AVAILABILITY (a regular zone) or LOCAL (an edge location such as the "
+            "Bangkok zone) — the console groups zones by this"
+        ),
+    )
+    is_default: bool = Field(
+        False, description="The zone the API falls back to when a create omits zoneId"
+    )
+    description: str = Field(
+        "",
+        description=(
+            "Human-readable description. 'Contact to enable' means the zone is gated "
+            "per account by GreenNode support even though `enabled` is true"
+        ),
+    )
     enabled: bool = Field(True, description="Whether the zone accepts new resources")
 
     @classmethod
@@ -24,6 +42,8 @@ class ZoneItem(BaseModel):
         return cls(
             id=_resource_id(data),
             name=data.get("name") or "",
+            zone_type=data.get("zoneType") or "",
+            is_default=bool(data.get("isDefault", False)),
             description=data.get("description") or "",
             enabled=bool(data.get("isEnabled", True)),
         )

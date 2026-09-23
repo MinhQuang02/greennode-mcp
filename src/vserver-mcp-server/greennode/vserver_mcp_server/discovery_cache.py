@@ -16,6 +16,7 @@ TTL_CONFIG: dict[str, int] = {
     "list_volume_types": 1800,
     "list_placement_group_policies": 3600,
     "list_snapshot_policies": 1800,
+    "get_vpc_config_options": 3600,
     "list_vpcs": 120,
     "list_subnets": 120,
     "list_security_groups": 120,

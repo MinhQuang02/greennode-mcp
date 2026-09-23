@@ -8,6 +8,7 @@ secondary subnets, the tag catalogue and the v1 by-id detail envelope.
 from __future__ import annotations
 
 import httpx
+import json
 import pytest
 import respx
 from greennode.vserver_mcp_server.auth import TokenManager
@@ -20,6 +21,7 @@ from greennode.vserver_mcp_server.models import (
     CreateSecondarySubnetDto,
     DeletePersistentVolumeDto,
     PersistentVolumeItem,
+    UpdateSubnetDto,
     VolumeHistoryItem,
 )
 from greennode.vserver_mcp_server.paging import unwrap_one
@@ -304,20 +306,112 @@ async def test_new_volume_write_tools_are_gated(volumes_ro):
 # ── secondary subnets and tags ────────────────────────────────────────────────
 
 
+def _subnet_payload(*secondaries: dict, name: str = "web") -> dict:
+    """A subnet object shaped exactly like the live detail/list/PATCH answer."""
+    return {
+        "uuid": SUBNET,
+        "status": "ACTIVE",
+        "cidr": "10.0.0.0/22",
+        "networkUuid": VPC,
+        "name": name,
+        "zone": {"uuid": "HCM03-1C", "name": "HCM-1C", "zoneType": "AVAILABILITY"},
+        "secondarySubnets": list(secondaries),
+    }
+
+
+SEC_A = {"cidr": "10.0.8.0/24", "name": "sec-a", "uuid": "sec-sub-aaaa"}
+SEC_B = {"cidr": "10.0.9.0/24", "name": "sec-b", "uuid": "sec-sub-bbbb"}
+SUBNET_PATH = f"{HCM3}/v2/{PROJECT}/networks/{VPC}/subnets/{SUBNET}"
+
+
 @respx.mock
 @pytest.mark.asyncio
-async def test_create_secondary_subnet_hits_the_nested_path(subnets):
+async def test_create_secondary_subnet_returns_the_parent_subnet(subnets):
+    """The POST answers with the NEW RANGE ({cidr, name, uuid}), not the subnet.
+
+    Parsed as a SubnetItem that gave status/zone_id/vpc_id = "" and, worse, an
+    `id` holding the secondary range's uuid — which an agent then passes on as
+    a subnet id. The tool re-reads the parent subnet instead.
+    """
     _mock_iam(respx.mock)
-    route = respx.post(
-        f"{HCM3}/v2/{PROJECT}/networks/{VPC}/subnets/{SUBNET}/secondary-subnets"
-    ).mock(return_value=httpx.Response(200, json={"data": {"id": "sub-sec-1", "name": "extra"}}))
-    await subnets.create_secondary_subnet(
+    post = respx.post(f"{SUBNET_PATH}/secondary-subnets").mock(
+        return_value=httpx.Response(200, json={"data": SEC_B})
+    )
+    respx.get(SUBNET_PATH).mock(
+        return_value=httpx.Response(200, json=_subnet_payload(SEC_A, SEC_B))
+    )
+    result = await subnets.create_secondary_subnet(
         vpc_id=VPC,
         subnet_id=SUBNET,
-        body=CreateSecondarySubnetDto(name="extra", cidr="10.0.9.0/24"),
+        body=CreateSecondarySubnetDto(name="sec-b", cidr="10.0.9.0/24"),
         region="HCM-3",
     )
-    assert route.calls[0].request.read() == b'{"name":"extra","cidr":"10.0.9.0/24"}'
+    assert post.calls[0].request.read() == b'{"name":"sec-b","cidr":"10.0.9.0/24"}'
+    assert (result.id, result.status, result.zone_id, result.vpc_id) == (
+        SUBNET,
+        "ACTIVE",
+        "HCM03-1C",
+        VPC,
+    )
+    assert [(s.id, s.cidr) for s in result.secondary_subnets] == [
+        ("sec-sub-aaaa", "10.0.8.0/24"),
+        ("sec-sub-bbbb", "10.0.9.0/24"),
+    ]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_rename_only_update_keeps_the_secondary_subnets(subnets):
+    """Verified live: a PATCH without `secondarySubnetRequests` DELETES them all.
+
+    So a plain rename re-sends the current set, read from the subnet first.
+    """
+    _mock_iam(respx.mock)
+    respx.get(SUBNET_PATH).mock(
+        return_value=httpx.Response(200, json=_subnet_payload(SEC_A, SEC_B))
+    )
+    patch = respx.patch(SUBNET_PATH).mock(
+        return_value=httpx.Response(
+            200, json={"data": _subnet_payload(SEC_A, SEC_B, name="web-renamed")}
+        )
+    )
+    result = await subnets.update_subnet(
+        vpc_id=VPC,
+        subnet_id=SUBNET,
+        body=UpdateSubnetDto(name="web-renamed"),
+        region="HCM-3",
+    )
+    sent = json.loads(patch.calls[0].request.read())
+    assert sent == {
+        "name": "web-renamed",
+        "secondarySubnetRequests": [
+            {"name": "sec-a", "cidr": "10.0.8.0/24", "uuid": "sec-sub-aaaa"},
+            {"name": "sec-b", "cidr": "10.0.9.0/24", "uuid": "sec-sub-bbbb"},
+        ],
+    }
+    assert result.name == "web-renamed" and len(result.secondary_subnets) == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_update_with_an_explicit_empty_list_clears_them(subnets):
+    """An explicit [] is the caller's decision to remove every range — sent as is."""
+    _mock_iam(respx.mock)
+    detail = respx.get(SUBNET_PATH)
+    patch = respx.patch(SUBNET_PATH).mock(
+        return_value=httpx.Response(200, json={"data": _subnet_payload()})
+    )
+    await subnets.update_subnet(
+        vpc_id=VPC,
+        subnet_id=SUBNET,
+        body=UpdateSubnetDto(name="web", secondarySubnetRequests=[]),
+        region="HCM-3",
+    )
+    assert json.loads(patch.calls[0].request.read()) == {
+        "name": "web",
+        "secondarySubnetRequests": [],
+    }
+    assert not detail.calls
 
 
 def test_secondary_subnet_dto_rejects_unknown_fields():

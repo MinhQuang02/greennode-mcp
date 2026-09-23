@@ -18,7 +18,7 @@ from greennode.vserver_mcp_server.validators import validate_id
 from pydantic import Field
 
 
-async def _zone_list(
+async def fetch_zone_list(
     config: VserverConfig,
     client: VserverClient,
     cache: DiscoveryCache,
@@ -76,8 +76,15 @@ class ZoneHandler:
     ) -> ZoneListData:
         """List the enabled availability zones of a region.
 
-        Returns {region, zones[{id, name, description, enabled}]}; disabled
-        zones are excluded because they cannot host new resources.
+        Returns {region, zones[{id, name, zone_type, is_default, description,
+        enabled}]}; disabled zones are excluded because they cannot host new
+        resources.
+
+        `id` (HCM03-1C) is what every tool takes; `name` (HCM-1C) is only the
+        label the console shows. Present zones the way the console does —
+        grouped by `zone_type` (AVAILABILITY, then LOCAL) with the default one
+        marked. A description ending in "Contact to enable" means GreenNode
+        support gates that zone per account: say so before the user picks it.
 
         ## Workflow
         - Step 1 of every creation flow (server, volume, subnet, network
@@ -86,7 +93,7 @@ class ZoneHandler:
         - The chosen `id` is the `zoneId` for create_server / create_volume /
           create_subnet, and it scopes the flavor and volume-type catalogues.
         """
-        return await _zone_list(
+        return await fetch_zone_list(
             self.config, self.client, self.cache, region=region, refresh=refresh
         )
 

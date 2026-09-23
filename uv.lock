@@ -757,7 +757,7 @@ source = { virtual = "." }
 
 [[package]]
 name = "greennode-mcp-core"
-version = "0.5.0"
+version = "0.5.1"
 source = { editable = "src/mcp-core" }
 dependencies = [
     { name = "cachetools" },
@@ -788,7 +788,7 @@ dev = [
 
 [[package]]
 name = "greennode-vbackup-mcp-server"
-version = "0.0.0"
+version = "0.1.1"
 source = { editable = "src/vbackup-mcp-server" }
 dependencies = [
     { name = "cachetools" },
@@ -840,7 +840,7 @@ dev = [
 
 [[package]]
 name = "greennode-vks-mcp-server"
-version = "0.14.2"
+version = "0.14.3"
 source = { editable = "src/vks-mcp-server" }
 dependencies = [
     { name = "cachetools" },
@@ -900,7 +900,7 @@ dev = [
 
 [[package]]
 name = "greennode-vmonitor-mcp-server"
-version = "0.0.0"
+version = "0.1.1"
 source = { editable = "src/vmonitor-mcp-server" }
 dependencies = [
     { name = "greennode-mcp-core" },
@@ -950,7 +950,7 @@ dev = [
 
 [[package]]
 name = "greennode-vserver-mcp-server"
-version = "0.0.0"
+version = "0.1.1"
 source = { editable = "src/vserver-mcp-server" }
 dependencies = [
     { name = "cachetools" },

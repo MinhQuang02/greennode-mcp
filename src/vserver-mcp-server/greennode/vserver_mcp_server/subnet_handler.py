@@ -161,10 +161,12 @@ class SubnetHandler:
         - Requires `--allow-write`.
         - `name` is mandatory on every call — pass the current name when you
           only mean to change the secondary subnets or tags.
-        - `secondarySubnetRequests` is a **full replacement**: any secondary
-          CIDR you omit is removed. Read the current set from
-          `get_subnet(...).secondary_subnets` and send it back with your
-          additions.
+        - `secondarySubnetRequests` is a **full replacement** when you pass it:
+          any secondary CIDR missing from the list is removed, and `[]` removes
+          them all. Leave it out to keep the current set — the API itself would
+          delete every range on a PATCH without it, so this tool re-sends them.
+        - To add ONE range, prefer create_secondary_subnet; to drop one,
+          delete_secondary_subnet. Both leave the others untouched.
         - The primary `cidr` and the zone of an existing subnet are immutable.
         """
         require_write(self.allow_write)
@@ -172,6 +174,13 @@ class SubnetHandler:
         validate_id(subnet_id, "subnet_id")
         pid = await require_project_id(self.config, self.client, region)
         payload = body.model_dump(exclude_none=True)
+        if body.secondarySubnetRequests is None:
+            # Verified live: a PATCH without this key deletes every secondary
+            # range, so a plain rename must carry the current set back.
+            current = SubnetItem.from_api(await self._subnet_raw(pid, vpc_id, subnet_id, region))
+            payload["secondarySubnetRequests"] = [
+                {"name": s.name, "cidr": s.cidr, "uuid": s.id} for s in current.secondary_subnets
+            ]
         data = await self.client.patch(
             f"/v2/{pid}/networks/{vpc_id}/subnets/{subnet_id}", region=region, json=payload
         )
@@ -188,8 +197,9 @@ class SubnetHandler:
 
         ## Requirements
         - Requires `--allow-write`.
-        - The subnet must have no servers or network interfaces attached; the
-          API rejects the call otherwise.
+        - The subnet must have no servers, network interfaces or secondary
+          subnets; the API rejects the call otherwise ("Having Virtual Subnet
+          Address is using this subnet" for a leftover secondary range).
 
         ## Workflow
         - Show the user the subnet's id, name and CIDR and get explicit
@@ -203,6 +213,14 @@ class SubnetHandler:
         self.cache.invalidate("list_subnets")
         return f"Subnet {subnet_id} deleted."
 
+    async def _subnet_raw(self, pid: str, vpc_id: str, subnet_id: str, region: str | None) -> dict:
+        """Read one subnet uncached, whichever envelope the detail comes in."""
+        data = await self.client.get(
+            f"/v2/{pid}/networks/{vpc_id}/subnets/{subnet_id}", region=region
+        )
+        payload = unwrap(data)
+        return payload if isinstance(payload, dict) else {}
+
     async def create_secondary_subnet(
         self,
         vpc_id: str = Field(..., description="VPC ID the subnet belongs to."),
@@ -210,7 +228,12 @@ class SubnetHandler:
         body: CreateSecondarySubnetDto = Field(..., description="Extra CIDR to add."),
         region: Region = Field("HCM-3", description="Region ('HCM-3' or 'HAN')."),
     ) -> SubnetItem:
-        """Add a secondary CIDR to a subnet.
+        """Add a secondary CIDR to a subnet, leaving its other ranges untouched.
+
+        Returns the PARENT subnet, re-read after the add — {id, name, cidr,
+        status, zone_id, vpc_id, secondary_subnets}; the new range is in
+        `secondary_subnets` with its own id (`sec-sub-…`), which
+        delete_secondary_subnet and the address-pair tools take.
 
         ## Requirements
         - Requires `--allow-write`.
@@ -230,13 +253,16 @@ class SubnetHandler:
         validate_id(vpc_id, "vpc_id")
         validate_id(subnet_id, "subnet_id")
         pid = await require_project_id(self.config, self.client, region)
-        data = await self.client.post(
+        # The POST answers with the new range alone ({cidr, name, uuid}); parsed
+        # as a subnet it has no status, zone or VPC and its uuid poses as the
+        # subnet id. Re-read the parent so callers get the subnet they asked about.
+        await self.client.post(
             f"/v2/{pid}/networks/{vpc_id}/subnets/{subnet_id}/secondary-subnets",
             region=region,
             json=body.model_dump(exclude_none=True),
         )
         self.cache.invalidate("list_subnets")
-        return SubnetItem.from_api(unwrap(data) or {})
+        return SubnetItem.from_api(await self._subnet_raw(pid, vpc_id, subnet_id, region))
 
     async def delete_secondary_subnet(
         self,

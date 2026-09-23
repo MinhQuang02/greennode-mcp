@@ -189,6 +189,41 @@ async def test_list_zones_returns_structured_and_filters_disabled(handler):
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_list_zones_reports_type_and_default_like_the_console(handler):
+    """The console groups zones by zoneType and marks the default; the id is not the label."""
+    _mock_iam(respx.mock)
+    respx.get(f"{HCM3}/v1/{PROJECT}/zones").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "uuid": "HCM03-1C",
+                        "name": "HCM-1C",
+                        "zoneType": "AVAILABILITY",
+                        "isDefault": True,
+                        "isEnabled": True,
+                    },
+                    {
+                        "uuid": "HCM03-BKK-01",
+                        "name": "HCM-BKK-1A",
+                        "zoneType": "LOCAL",
+                        "isDefault": False,
+                        "isEnabled": True,
+                    },
+                ]
+            },
+        )
+    )
+    result = await handler.list_zones(region="HCM-3", refresh=False)
+    assert [(z.id, z.name, z.zone_type, z.is_default) for z in result.zones] == [
+        ("HCM03-1C", "HCM-1C", "AVAILABILITY", True),
+        ("HCM03-BKK-01", "HCM-BKK-1A", "LOCAL", False),
+    ]
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_list_zones_is_cached_until_refresh(handler):
     _mock_iam(respx.mock)
     route = respx.get(f"{HCM3}/v1/{PROJECT}/zones").mock(

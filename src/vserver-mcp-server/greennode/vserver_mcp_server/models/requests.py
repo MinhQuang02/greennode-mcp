@@ -8,6 +8,7 @@ forwarded blind.
 
 from __future__ import annotations
 
+import ipaddress
 from greennode.vserver_mcp_server.models._common import TagDto
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Literal
@@ -32,23 +33,125 @@ class SecondarySubnetRequestDto(BaseModel):
     )
 
 
+# The console's create-VPC form, mirrored rule for rule. The CIDR box takes a
+# base address with a FIXED "/16" suffix and lists three allowed ranges; the
+# API itself would also take /20, /22 and /24, but the product only offers /16
+# and this server follows the product. Outside the ranges the API answers
+# "User can't use this range, reserved for system" (172.25-172.31 included).
+VPC_CIDR_PREFIX = "/16"
+VPC_CIDR_RANGES = (
+    "10.0.0.0/16 - 10.255.0.0/16",
+    "172.16.0.0/16 - 172.24.0.0/16",
+    "192.168.0.0/16",
+)
+VPC_NAME_RULE = "5-50 characters: letters (a-z, A-Z), digits, '_' and '-' only"
+_VPC_NAME_PATTERN = r"^[A-Za-z0-9_-]+$"
+
+
+def _vpc_cidr(value: str) -> str:
+    """Normalise and check a VPC CIDR the way the console form does.
+
+    Accepts the bare base address the form asks for (``10.5.0.0``) as well as
+    ``10.5.0.0/16``; anything but /16, a base with host bits set, or an address
+    outside the three private ranges is refused with the rule spelled out —
+    the API's own answers ("Invalid CIDR.", "reserved for system") name none of
+    it.
+    """
+    raw = value.strip()
+    address, _, prefix = raw.partition("/")
+    if prefix and f"/{prefix}" != VPC_CIDR_PREFIX:
+        raise ValueError(
+            f"A VPC CIDR is always {VPC_CIDR_PREFIX} — the console offers no other size; "
+            f"got '/{prefix}'. Ask the user for a base address such as 10.5.0.0 instead. "
+            "(The /18 … /28 lengths in get_vpc_config_options are for SUBNETS.)"
+        )
+    try:
+        net = ipaddress.IPv4Network(f"{address}{VPC_CIDR_PREFIX}", strict=True)
+    except ValueError as exc:
+        raise ValueError(
+            f"'{address}' is not a {VPC_CIDR_PREFIX} network address: use four octets "
+            "ending in .0.0, e.g. 10.5.0.0."
+        ) from exc
+    first, second = net.network_address.packed[:2]
+    if not (
+        first == 10 or (first == 172 and 16 <= second <= 24) or (first == 192 and second == 168)
+    ):
+        raise ValueError(
+            f"{net} is outside the private ranges a VPC may use: {list(VPC_CIDR_RANGES)}. "
+            "172.25.0.0 and above are reserved for the platform."
+        )
+    return str(net)
+
+
 class CreateVpcDto(BaseModel):
-    """Request body for POST /v2/{projectId}/networks."""
+    """Request body for POST /v2/{projectId}/networks.
+
+    Mirrors the console's create-VPC form field for field: name, a /16 CIDR
+    from three private ranges, MTU, a mandatory zone, optional tags. The API is
+    laxer on two of them — it silently applies ``mtu: 1500`` and the region's
+    default zone when they are omitted — and both are permanent, so they are
+    required here and put to the user rather than defaulted.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(..., description="VPC name")
-    cidr: str = Field(..., description="CIDR block, e.g. 10.0.0.0/16")
-    zoneId: str | None = Field(None, description="Availability zone id from list_zones")
+    name: str = Field(
+        ...,
+        min_length=5,
+        max_length=50,
+        pattern=_VPC_NAME_PATTERN,
+        description=f"VPC name, {VPC_NAME_RULE}. Must be unique within the project",
+    )
+    cidr: str = Field(
+        ...,
+        description=(
+            "The VPC network, always /16: pass the base address the user chose "
+            "(10.5.0.0) or the same with its suffix (10.5.0.0/16). Allowed ranges: "
+            "10.0.0.0-10.255.0.0, 172.16.0.0-172.24.0.0 and 192.168.0.0. It must not "
+            "overlap a VPC that already exists in the region — get_vpc_config_options "
+            "lists them under `vpc_cidrs_in_use`. Cannot be changed after creation"
+        ),
+    )
+    mtu: int = Field(
+        ...,
+        description=(
+            "MTU in BYTES, one of `mtu_options` from get_vpc_config_options (currently "
+            "1450, 1500, 8500, 8950; served dynamically). The console preselects 1500 — "
+            "offer it as the recommended answer, but ask: it cannot be changed later. "
+            "8500/8950 are jumbo frames for east-west traffic inside the VPC"
+        ),
+    )
+    zoneId: str = Field(
+        ...,
+        description=(
+            "Zone id (`id` from list_zones, e.g. HCM03-1C — not the display name "
+            "HCM-1C). Mandatory, as in the console: an Availability zone or a Local "
+            "zone (zone_type LOCAL, e.g. the Bangkok zone)"
+        ),
+    )
     tags: list[TagDto] | None = Field(None, description="Optional key/value tags")
+
+    @field_validator("cidr")
+    @classmethod
+    def _check_cidr(cls, value: str) -> str:
+        return _vpc_cidr(value)
 
 
 class UpdateVpcDto(BaseModel):
-    """Request body for PATCH /v2/{projectId}/networks/{networkId}."""
+    """Request body for PATCH /v2/{projectId}/networks/{networkId}.
+
+    Carries no ``mtu`` and no ``cidr``: both are fixed at creation time.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(..., description="New VPC name; the API requires it on every edit")
+    name: str = Field(
+        ...,
+        min_length=5,
+        max_length=50,
+        pattern=_VPC_NAME_PATTERN,
+        description=f"New VPC name, {VPC_NAME_RULE}; the API requires it on every edit",
+    )
     zoneId: str | None = Field(None, description="Availability zone id")
     tags: list[TagDto] | None = Field(None, description="Optional key/value tags")
 
@@ -59,7 +162,15 @@ class CreateSubnetDto(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(..., description="Subnet name")
-    cidr: str = Field(..., description="Subnet CIDR, must fall inside the VPC CIDR")
+    cidr: str = Field(
+        ...,
+        description=(
+            "Subnet CIDR, must fall inside the VPC CIDR. The prefix length must be one "
+            "of `subnet_cidr_prefixes` from get_vpc_config_options (/16, /18, /20, /22, /24, "
+            "/26, /28) — unlike the VPC rule, the full list applies here, and the API "
+            "names the allowed set when it refuses"
+        ),
+    )
     zoneId: str | None = Field(
         None, description="Availability zone id from list_zones; pins the zone of its servers"
     )
@@ -77,7 +188,11 @@ class UpdateSubnetDto(BaseModel):
     name: str = Field(..., description="New subnet name; the API requires it on every edit")
     zoneId: str | None = Field(None, description="Availability zone id")
     secondarySubnetRequests: list[SecondarySubnetRequestDto] | None = Field(
-        None, description="Full replacement list of secondary CIDRs"
+        None,
+        description=(
+            "Full replacement list of secondary CIDRs: a range missing from it is "
+            "deleted, [] deletes them all. Omit it to keep the current set"
+        ),
     )
     tags: list[TagDto] | None = Field(None, description="Optional key/value tags")
 

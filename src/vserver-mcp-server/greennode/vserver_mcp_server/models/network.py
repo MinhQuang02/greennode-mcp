@@ -43,6 +43,97 @@ class VpcItem(BaseModel):
         )
 
 
+class VpcCidrInUse(BaseModel):
+    """A CIDR an existing VPC already occupies in the region."""
+
+    id: str = Field(..., description="VPC ID")
+    name: str = Field("", description="VPC name")
+    cidr: str = Field("", description="The CIDR it occupies")
+    status: str = Field("", description="Lifecycle status; a CREATING/DELETING VPC still holds it")
+
+
+class VpcConfigOptionsData(BaseModel):
+    """Everything the console's create-VPC form offers, in one answer.
+
+    The MTU list and the subnet prefix list come from
+    ``/v1/common/dynamic-config``; the VPC CIDR rule is the form's own
+    (always /16, three private ranges); the CIDRs in use are read live from the
+    region's VPCs, because a new VPC must not overlap any of them.
+    """
+
+    region: str = Field(..., description="Region the options apply to")
+    name_rule: str = Field("", description="What a VPC name may contain")
+    mtu_options: list[int] = Field(
+        default_factory=list, description="Selectable MTU values in BYTES — ask the user"
+    )
+    recommended_mtu: int = Field(
+        1500,
+        description="What the console preselects; offer it as the recommended answer, still ask",
+    )
+    vpc_cidr_prefix: str = Field(
+        "/16", description="The ONLY prefix length a VPC is created with — not a choice"
+    )
+    vpc_cidr_ranges: list[str] = Field(
+        default_factory=list,
+        description="Private ranges the /16 base address must fall in — ask the user for one",
+    )
+    vpc_cidrs_in_use: list[VpcCidrInUse] = Field(
+        default_factory=list,
+        description=(
+            "CIDRs existing VPCs of this region already hold, every status included. "
+            "Show them to the user; a new VPC must not overlap any"
+        ),
+    )
+    subnet_cidr_prefixes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Prefix lengths a SUBNET may use (create_subnet). NOT options for the VPC "
+            "itself, which is always /16"
+        ),
+    )
+
+    @classmethod
+    def from_api(
+        cls,
+        data: dict,
+        region: str,
+        *,
+        name_rule: str,
+        vpc_cidr_prefix: str,
+        vpc_cidr_ranges: list[str],
+        in_use: list[VpcCidrInUse] | None = None,
+    ) -> "VpcConfigOptionsData":
+        """Build the form options from the raw dynamic-config object.
+
+        The endpoint answers with a **bare object** — no ``data`` or ``success``
+        envelope, unlike everything on the vServer gateway. Its
+        ``cidrNotationConfigs`` is the SUBNET rule (the subnet endpoint echoes
+        the same list when it refuses a prefix), so it lands in
+        ``subnet_cidr_prefixes`` and never next to the VPC choices.
+        """
+        payload = data if isinstance(data, dict) else {}
+        mtus = payload.get("mtuConfig")
+        prefixes = payload.get("cidrNotationConfigs")
+        mtu_options = [int(m) for m in (mtus if isinstance(mtus, list) else []) if _is_int(m)]
+        return cls(
+            region=region,
+            name_rule=name_rule,
+            mtu_options=mtu_options,
+            recommended_mtu=1500 if not mtu_options or 1500 in mtu_options else mtu_options[0],
+            vpc_cidr_prefix=vpc_cidr_prefix,
+            vpc_cidr_ranges=list(vpc_cidr_ranges),
+            vpc_cidrs_in_use=list(in_use or []),
+            subnet_cidr_prefixes=[
+                str(p) for p in (prefixes if isinstance(prefixes, list) else []) if str(p).strip()
+            ],
+        )
+
+
+def _is_int(value: object) -> bool:
+    """True when *value* is a whole number the MTU list can carry."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 class VpcListData(BaseModel):
     """Structured response for list_vpcs."""
 
