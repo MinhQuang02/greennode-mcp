@@ -59,17 +59,24 @@ uv run vks-mcp-server --allow-sensitive-data-access
 # HTTP transport (default: stdio); Docker image serves this on port 8080
 uv run vks-mcp-server --transport streamable-http --host 0.0.0.0 --port 8080
 
+# HTTP: serve requests WITHOUT a bearer token as the service account (default: 401)
+uv run vks-mcp-server --transport streamable-http --allow-service-account-fallback
+
 ```
 
 ## Auth (HTTP transport)
 
-Per-request upstream identity, no flags: an IAM bearer token in `Authorization`
+Per-request upstream identity: an IAM bearer token in `Authorization`
 (forwarded by the AgentBase Gateway) → every VKS/vServer call runs as that
 caller (per-user projects; caches isolated per caller identity; a rejected user
-token never falls back to the service account). No token → the shared service
-account (`~/.greennode` / `GRN_CLIENT_ID`+`GRN_CLIENT_SECRET`). Neither → 401.
-The server boots credential-less on HTTP (passthrough-only); stdio requires
-service-account credentials. `/health` is always open.
+token never falls back to the service account). No token → 401, unless the
+operator opts in with `--allow-service-account-fallback` (env
+`GRN_MCP_ALLOW_SERVICE_ACCOUNT_FALLBACK`) and service-account credentials are
+configured — the fallback hands the service account to anyone who can reach the
+port, so it is off by default. The server boots credential-less on HTTP
+(passthrough-only); stdio requires service-account credentials. `/health` is
+always open. `get_access_token` reports the identity mode only — no tool ever
+returns a token.
 `--auth-debug` (env `GRN_MCP_AUTH_DEBUG=1`) is an opt-in, redacted, HTTP-only diagnostic: logs a summary of inbound request auth and exposes `GET /whoami`. Never verifies signatures, never logs the full token; off by default; not for production.
 
 ## Write DTO field scope

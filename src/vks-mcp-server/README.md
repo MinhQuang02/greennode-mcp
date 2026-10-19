@@ -86,7 +86,7 @@ serves streamable-http on port 8080.
 
 ### Authentication (HTTP transport)
 
-One behavior, no flags — the upstream identity is resolved per request:
+The upstream identity is resolved per request:
 
 1. The request carries an IAM bearer token in `Authorization` (the AgentBase
    Gateway forwards the caller's token) → **every VKS/vServer call runs as
@@ -94,10 +94,12 @@ One behavior, no flags — the upstream identity is resolved per request:
    user token is surfaced as an error — never silently retried as the
    service account. All caches (discovery, kubernetes clients, project_id)
    are isolated per caller.
-2. No token, but service-account credentials are configured
-   (`~/.greennode` or `GRN_CLIENT_ID`/`GRN_CLIENT_SECRET`) → the shared
-   service account.
-3. Neither → **401** + `WWW-Authenticate`.
+2. No token → **401** + `WWW-Authenticate`, even when service-account
+   credentials are configured. Serving such requests as the shared service
+   account is opt-in: `--allow-service-account-fallback` (env
+   `GRN_MCP_ALLOW_SERVICE_ACCOUNT_FALLBACK=1`) — only for a port reachable
+   solely through a trusted authenticating proxy, since otherwise anyone who
+   can reach it acts as the service account.
 
 The server also boots with **no credentials at all** (passthrough-only
 deployments behind the Gateway) — every request then requires a token.
@@ -177,7 +179,8 @@ Secrets/logs/events requires `--allow-sensitive-data-access`.
 
 ### Auth (1)
 
-`get_access_token` — current IAM bearer token + endpoint URLs (auto-refreshed).
+`get_access_token` — checks authentication: which identity calls run as
+(caller token or service account) + endpoint URLs. Never returns the token.
 
 ## Prompts
 

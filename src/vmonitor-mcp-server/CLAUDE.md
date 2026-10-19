@@ -556,6 +556,10 @@ uv run vmonitor-mcp-server --transport streamable-http --host 0.0.0.0 --port 808
 
 # Redacted inbound-auth diagnostic (HTTP only; also env GRN_MCP_AUTH_DEBUG=1)
 uv run vmonitor-mcp-server --transport streamable-http --auth-debug
+
+# HTTP: serve requests WITHOUT a bearer token as the service account (default: 401;
+# also env GRN_MCP_ALLOW_SERVICE_ACCOUNT_FALLBACK=1). Only behind an authenticating proxy.
+uv run vmonitor-mcp-server --transport streamable-http --allow-service-account-fallback
 ```
 
 `--auth-debug` logs a redacted `AUTH-DEBUG {...}` line per request and exposes

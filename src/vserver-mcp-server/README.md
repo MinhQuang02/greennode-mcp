@@ -40,12 +40,15 @@ uv run vserver-mcp-server --transport streamable-http --host 0.0.0.0 --port 8080
 
 ### Auth (HTTP transport)
 
-Per-request upstream identity, no flags: an IAM bearer token in `Authorization`
+Per-request upstream identity: an IAM bearer token in `Authorization`
 (forwarded by the AgentBase Gateway) → every vServer call runs as that caller
 (per-user projects; caches isolated per caller identity; a rejected user token
-never falls back to the service account). No token → the shared service account.
-Neither → 401. The server boots credential-less on HTTP (passthrough-only);
-stdio requires service-account credentials. `/health` is always open.
+never falls back to the service account). No token → 401, even when
+service-account credentials are configured; `--allow-service-account-fallback`
+(env `GRN_MCP_ALLOW_SERVICE_ACCOUNT_FALLBACK=1`) serves such requests as the
+service account — only behind a trusted authenticating proxy. The server boots
+credential-less on HTTP (passthrough-only); stdio requires service-account
+credentials. `/health` is always open.
 
 `--auth-debug` (env `GRN_MCP_AUTH_DEBUG=1`) is an opt-in, redacted, HTTP-only
 diagnostic: it logs a summary of inbound request auth and exposes `GET /whoami`.
@@ -84,7 +87,7 @@ written in Vietnamese, like the other GreenNode MCP servers.
 
 | Tool | Access | Description |
 |------|--------|-------------|
-| `get_access_token` | read | Current IAM token, region and endpoint |
+| `get_access_token` | read | Auth check: identity mode, region and endpoint (never the token) |
 | `list_zones` | read | Enabled availability zones — step 1 of every creation flow |
 | `list_flavor_families` | read | Instance families (`general-purpose`, `gpu`) |
 | `list_flavor_codes` | read | CPU/GPU platform codes |

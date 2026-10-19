@@ -98,15 +98,17 @@ serves streamable-http on port 8080.
 
 ### Authentication (HTTP transport)
 
-The upstream identity is resolved per request, no flags:
+The upstream identity is resolved per request:
 
 1. The request carries an IAM bearer token in `Authorization` (the AgentBase
    Gateway forwards the caller's token) → **every vMonitor call runs as that
    caller**. A rejected user token is surfaced as an error, never silently
    retried as the service account.
-2. No token, but service-account credentials are configured (`~/.greennode` or
-   `GRN_CLIENT_ID` / `GRN_CLIENT_SECRET`) → the shared service account.
-3. Neither → **401** + `WWW-Authenticate: Bearer`.
+2. No token → **401** + `WWW-Authenticate: Bearer`, even when service-account
+   credentials are configured. Serving such requests as the shared service
+   account is opt-in: `--allow-service-account-fallback` (env
+   `GRN_MCP_ALLOW_SERVICE_ACCOUNT_FALLBACK=1`) — only for a port reachable
+   solely through a trusted authenticating proxy.
 
 The HTTP transport can boot with **no credentials at all**
 (passthrough-only deployments behind the Gateway) — every request then requires

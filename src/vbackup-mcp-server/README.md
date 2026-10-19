@@ -50,9 +50,11 @@ uv run vbackup-mcp-server --transport streamable-http --host 0.0.0.0 --port 8080
 ```
 
 Over **stdio** the server uses the configured service account. Over
-**streamable-http** it prefers the caller's IAM bearer token from the
-`Authorization` header, falling back to the service account; with neither it
-answers `401`.
+**streamable-http** every request must carry the caller's IAM bearer token in
+the `Authorization` header and runs as that caller; without one it answers
+`401`. `--allow-service-account-fallback` (env
+`GRN_MCP_ALLOW_SERVICE_ACCOUNT_FALLBACK=1`) serves token-less requests as the
+service account instead — only behind a trusted authenticating proxy.
 
 ### MCP client config
 
@@ -215,7 +217,7 @@ unknown metric name returns an empty `200` rather than an error.
 
 | Tool | Access | Description |
 |------|--------|-------------|
-| `get_access_token` | read | Current IAM access token, region and endpoint |
+| `get_access_token` | read | Auth check: identity mode, region and endpoint (never the token) |
 | `get_feature_guide` | read | Step-by-step guidance for a composite vBackup capability |
 
 **IAM-gated** tools answer `403 IAM_PERMISSION_DENIED` for a caller whose

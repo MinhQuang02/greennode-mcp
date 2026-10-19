@@ -112,7 +112,8 @@ The `Conventions` CI job enforces 4, 9, 10, and 12 mechanically.
 
 - **Input validation**: every ID used in URL construction goes through `mcp_core.validators.validate_id()` — prevents path traversal
 - **Write guard**: mutating operations must check the `allow_write` flag
-- **Tokens in memory only**: never written to disk or logged
+- **Tokens in memory only**: never written to disk, logged, or returned by a tool (`get_access_token` reports the identity mode only)
+- **HTTP requires a caller token**: on streamable-http a request without `Authorization: Bearer` gets 401; serving it as the service account is an explicit opt-in (`--allow-service-account-fallback` / `GRN_MCP_ALLOW_SERVICE_ACCOUNT_FALLBACK`). When a caller token is present, never consult the service account
 - **Credentials not logged**: error messages and debug logs never include tokens or secrets
 - **Timeout**: all HTTP requests have a 30s timeout (from `mcp_core.http`)
 

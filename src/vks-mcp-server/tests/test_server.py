@@ -50,11 +50,12 @@ _inner_app = Starlette(routes=[Route("/", _homepage)])
 
 
 # ---------------------------------------------------------------------------
-# Upstream identity: caller's IAM token when present, else service account, else 401
+# Upstream identity: caller's IAM token when present, else the service account
+# only when explicitly allowed, else 401
 # ---------------------------------------------------------------------------
 
 
-def _identity_app(has_service_credentials: bool):
+def _identity_app(allow_service_account_fallback: bool):
     from greennode.mcp_core.http import user_token_var
     from greennode.vks_mcp_server.server import UpstreamIdentityMiddleware
 
@@ -66,48 +67,67 @@ def _identity_app(has_service_credentials: bool):
 
     app = UpstreamIdentityMiddleware(
         Starlette(routes=[Route("/", echo_identity), Route("/health", echo_identity)]),
-        has_service_credentials=has_service_credentials,
+        allow_service_account_fallback=allow_service_account_fallback,
     )
     return app, seen
 
 
 def test_identity_middleware_uses_bearer_token_when_present():
     """A request carrying an IAM token runs as THAT caller."""
-    app, seen = _identity_app(has_service_credentials=True)
+    app, seen = _identity_app(allow_service_account_fallback=False)
     client = TestClient(app, raise_server_exceptions=False)
     r = client.get("/", headers={"Authorization": "Bearer user-iam-tok"})
     assert r.status_code == 200
     assert seen["token"] == "user-iam-tok"
 
 
-def test_identity_middleware_falls_back_to_service_account():
-    """No token + configured credentials -> the shared service account."""
-    app, seen = _identity_app(has_service_credentials=True)
+def test_identity_middleware_falls_back_to_service_account_when_allowed():
+    """No token + explicit opt-in -> the shared service account."""
+    app, seen = _identity_app(allow_service_account_fallback=True)
     client = TestClient(app, raise_server_exceptions=False)
     r = client.get("/")
     assert r.status_code == 200
     assert seen["token"] is None  # BaseClient will use the TokenManager
 
 
-def test_identity_middleware_401_when_no_token_and_no_credentials():
-    """Neither a token nor service credentials -> 401."""
-    app, seen = _identity_app(has_service_credentials=False)
+def test_identity_middleware_401_without_token_by_default():
+    """No token and no opt-in -> 401, even when service credentials exist."""
+    app, seen = _identity_app(allow_service_account_fallback=False)
     client = TestClient(app, raise_server_exceptions=False)
     r = client.get("/")
     assert r.status_code == 401
     assert "WWW-Authenticate" in r.headers
+    assert "token" not in seen  # the request never reached the app
 
 
 def test_identity_middleware_health_stays_open():
-    app, _ = _identity_app(has_service_credentials=False)
+    app, _ = _identity_app(allow_service_account_fallback=False)
     client = TestClient(app, raise_server_exceptions=False)
     assert client.get("/health").status_code == 200
+
+
+def test_service_account_fallback_flag_defaults_off():
+    assert _parse_args(["--transport", "streamable-http"]).allow_service_account_fallback is False
+    args = _parse_args(["--allow-service-account-fallback"])
+    assert args.allow_service_account_fallback is True
+
+
+@pytest.mark.parametrize(
+    "requested,has_credentials,expected",
+    [(False, True, False), (False, False, False), (True, False, False), (True, True, True)],
+)
+def test_service_account_fallback_needs_opt_in_and_credentials(
+    requested, has_credentials, expected
+):
+    from greennode.vks_mcp_server.server import _resolve_service_account_fallback
+
+    assert _resolve_service_account_fallback(requested, has_credentials) is expected
 
 
 def test_identity_middleware_resets_token_after_request():
     from greennode.mcp_core.http import user_token_var
 
-    app, _ = _identity_app(has_service_credentials=True)
+    app, _ = _identity_app(allow_service_account_fallback=True)
     client = TestClient(app, raise_server_exceptions=False)
     client.get("/", headers={"Authorization": "Bearer leak-check"})
     assert user_token_var.get() is None  # no bleed into the next context

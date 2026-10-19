@@ -231,14 +231,16 @@ class UpstreamIdentityMiddleware(BaseHTTPMiddleware):
     1. Bearer token on the request -> every vMonitor call runs as the CALLER
        (token scoped to this request via a contextvar; a rejected user token
        never falls back to the service account).
-    2. No token, but service-account credentials configured -> the shared
-       service account (GRN_CLIENT_ID / GRN_CLIENT_SECRET or ~/.greennode).
-    3. Neither -> 401.
+    2. No token, and the operator opted in (--allow-service-account-fallback
+       with service-account credentials configured) -> the shared service
+       account.
+    3. Otherwise -> 401. Without the opt-in, anyone who can reach the port
+       would act as the service account.
     """
 
-    def __init__(self, app, has_service_credentials: bool) -> None:
+    def __init__(self, app, allow_service_account_fallback: bool) -> None:
         super().__init__(app)
-        self._has_service_credentials = has_service_credentials
+        self._allow_service_account_fallback = allow_service_account_fallback
 
     async def dispatch(self, request: Request, call_next):
         """Resolve this request's upstream identity, then forward it."""
@@ -251,12 +253,10 @@ class UpstreamIdentityMiddleware(BaseHTTPMiddleware):
                 return await call_next(request)
             finally:
                 user_token_var.reset(ctx_token)
-        if self._has_service_credentials:
+        if self._allow_service_account_fallback:
             return await call_next(request)
         return Response(
-            "Unauthorized: provide the caller's IAM bearer token in the "
-            "Authorization header — no service-account credentials are "
-            "configured on this server.",
+            "Unauthorized: provide the caller's IAM bearer token in the Authorization header.",
             status_code=401,
             headers={"WWW-Authenticate": "Bearer"},
         )
@@ -278,6 +278,38 @@ class AuthDebugMiddleware(BaseHTTPMiddleware):
 def _env_truthy(val: str | None) -> bool:
     """True for common truthy env-var spellings (1/true/yes/on)."""
     return (val or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_service_account_fallback(requested: bool, has_service_credentials: bool) -> bool:
+    """Decide whether HTTP requests without a bearer token run as the service account.
+
+    Off unless the operator asks for it: the fallback turns network reach into
+    service-account access, so it belongs only behind a trusted authenticating
+    proxy. Prints why the decision was made so a 401 after an upgrade is easy
+    to trace.
+    """
+    if requested and has_service_credentials:
+        print(
+            "Warning: --allow-service-account-fallback is ON — HTTP requests without a "
+            "bearer token run as the service account. Expose this port only behind an "
+            "authenticating proxy.",
+            file=sys.stderr,
+        )
+        return True
+    if requested:
+        print(
+            "Note: --allow-service-account-fallback has no effect: no service-account "
+            "credentials are configured.",
+            file=sys.stderr,
+        )
+    elif has_service_credentials:
+        print(
+            "Note: HTTP requests without a bearer token are rejected (401); the configured "
+            "service-account credentials serve them only with "
+            "--allow-service-account-fallback.",
+            file=sys.stderr,
+        )
+    return False
 
 
 def _mode_addendum(allow_write: bool) -> str:
@@ -353,6 +385,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="DIAGNOSTIC: log redacted inbound auth summary and expose /whoami "
         "(HTTP transport only). Never enable in production.",
+    )
+    parser.add_argument(
+        "--allow-service-account-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="HTTP only: serve requests without a bearer token as the configured service "
+        "account instead of rejecting them with 401. Only for a port reachable solely "
+        "through a trusted authenticating proxy (env: GRN_MCP_ALLOW_SERVICE_ACCOUNT_FALLBACK).",
     )
     return parser
 
@@ -444,9 +484,16 @@ def main() -> None:
             transport_security=transport_security,
             host=args.host,
         )
+        # Per-request upstream identity: caller's IAM token when present,
+        # else the service account only when explicitly allowed, else 401.
+        sa_fallback = _resolve_service_account_fallback(
+            args.allow_service_account_fallback
+            or _env_truthy(os.environ.get("GRN_MCP_ALLOW_SERVICE_ACCOUNT_FALLBACK")),
+            bool(config.client_id and config.client_secret),
+        )
         starlette_app.add_middleware(
             UpstreamIdentityMiddleware,
-            has_service_credentials=bool(config.client_id and config.client_secret),
+            allow_service_account_fallback=sa_fallback,
         )
 
         if auth_debug:

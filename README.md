@@ -58,7 +58,9 @@ uv run vmonitor-mcp-server            # vMonitor (observability)
 uv run vserver-mcp-server             # vServer (compute)
 uv run vbackup-mcp-server             # vBackup (backups for vServer and vDB)
 
-# HTTP transport instead of stdio (e.g. for a Gateway / container)
+# HTTP transport instead of stdio (e.g. for a Gateway / container). Every request
+# must carry the caller's IAM bearer token (401 otherwise); add
+# --allow-service-account-fallback to serve token-less requests as the service account.
 uv run vmonitor-mcp-server --transport streamable-http --host 0.0.0.0 --port 8080
 ```
 

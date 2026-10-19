@@ -252,3 +252,81 @@ async def test_get_access_token_reports_region_and_endpoint(config):
     result = await handler.get_access_token()
     assert "region: HCM-3" in result
     assert API_BASE in result
+    assert "access_token: tok" not in result
+    assert "auth_mode: service account" in result
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_access_token_with_caller_token_skips_service_account(config):
+    from greennode.mcp_core.auth import IAM_TOKEN_URL, TokenManager
+    from greennode.mcp_core.http import user_token_var
+    from greennode.vbackup_mcp_server.auth_handler import AuthHandler
+
+    iam = respx.post(IAM_TOKEN_URL)
+    handler = AuthHandler(MCPServer("test"), config, TokenManager(config))
+    t = user_token_var.set("caller-token-xyz")
+    try:
+        result = await handler.get_access_token()
+    finally:
+        user_token_var.reset(t)
+    assert not iam.called
+    assert "caller-token-xyz" not in result
+    assert "auth_mode: caller IAM token" in result
+
+
+def _identity_client(allow_service_account_fallback: bool):
+    from greennode.mcp_core.http import user_token_var
+    from greennode.vbackup_mcp_server.server import UpstreamIdentityMiddleware
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    seen: dict = {}
+
+    async def echo_identity(request):
+        seen["token"] = user_token_var.get()
+        return PlainTextResponse("ok")
+
+    app = UpstreamIdentityMiddleware(
+        Starlette(routes=[Route("/", echo_identity), Route("/health", echo_identity)]),
+        allow_service_account_fallback=allow_service_account_fallback,
+    )
+    return TestClient(app, raise_server_exceptions=False), seen
+
+
+def test_identity_middleware_401_without_token_by_default():
+    client, seen = _identity_client(allow_service_account_fallback=False)
+    r = client.get("/")
+    assert r.status_code == 401
+    assert "token" not in seen
+    assert client.get("/health").status_code == 200
+
+
+def test_identity_middleware_bearer_runs_as_caller():
+    client, seen = _identity_client(allow_service_account_fallback=False)
+    assert client.get("/", headers={"Authorization": "Bearer user-tok"}).status_code == 200
+    assert seen["token"] == "user-tok"
+
+
+def test_identity_middleware_falls_back_only_when_allowed():
+    client, seen = _identity_client(allow_service_account_fallback=True)
+    assert client.get("/").status_code == 200
+    assert seen["token"] is None
+
+
+@pytest.mark.parametrize(
+    "requested,has_credentials,expected",
+    [(False, True, False), (False, False, False), (True, False, False), (True, True, True)],
+)
+def test_service_account_fallback_needs_opt_in_and_credentials(
+    requested, has_credentials, expected
+):
+    from greennode.vbackup_mcp_server.server import (
+        _build_parser,
+        _resolve_service_account_fallback,
+    )
+
+    assert _build_parser().parse_args([]).allow_service_account_fallback is False
+    assert _resolve_service_account_fallback(requested, has_credentials) is expected
